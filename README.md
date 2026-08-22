@@ -14,6 +14,15 @@ GET  /v1/healthz  →  uptime + context counts
 GET  /v1/metadata →  bot identity
 ```
 
+```mermaid
+graph TD
+    Category[Category Context<br>vertical tone, taboos, benchmarks] --> Composer
+    Merchant[Merchant Context<br>identity, active offers, performance] --> Composer
+    Trigger[Trigger Context<br>event family, payload, urgency] --> Composer
+    Customer[Customer Context<br>relationship, slots, preferred slots] --> Composer
+    Composer{Composer LLM} --> Action[Composed Action<br>body, cta, send_as, suppression_key]
+```
+
 ### Composition pipeline (`composer.py`)
 1. `compose(category, merchant, trigger, customer?)` called per trigger
 2. `prompts.py` builds a **system prompt** (category voice rules, taboos, CTA style, trigger-kind instructions) + **user prompt** (full context summary with real numbers)
@@ -32,6 +41,21 @@ GET  /v1/metadata →  bot identity
 | **Engagement compulsion** | Prompt requires 1-3 compulsion levers: specificity, loss aversion, social proof, effort externalization, curiosity, or reciprocity. Single CTA last. |
 
 ### Reply handling (`conversation.py` + `main.py`)
+```mermaid
+graph TD
+    A[Incoming /v1/reply] --> B{Hostile / Opt-out?}
+    B -- Yes --> C[action: end + suppress merchant 30d]
+    B -- No --> D{WhatsApp Auto-reply?}
+    D -- Yes (1st) --> E[action: send signal message to owner]
+    D -- Yes (2nd) --> F[action: wait 86400s]
+    D -- Yes (3rd+) --> G[action: end conversation]
+    D -- No --> H{Intent Commitment 'yes/let's do it'?}
+    H -- Yes --> I[action: send concrete deliverable + CONFIRM CTA]
+    H -- No --> J{Out of Scope: GST/Tax/Legal?}
+    J -- Yes --> K[action: send polite decline + redirect]
+    J -- No --> L[action: send contextual LLM follow-up]
+```
+
 - **Auto-reply**: Pattern-matched against 15+ canned phrases. Turn 1 → signal message. Turn 2 → wait 24h. Turn 3+ → end.
 - **Intent commitment**: Detected via regex ("yes", "let's do it", "chalega", "thik hai", etc.). Routes immediately to action composition — no qualifying questions.
 - **Hostile / opt-out**: Detected + merchant suppressed for session. Graceful `end`.
@@ -72,11 +96,3 @@ cd ..
 python judge_simulator.py
 ```
 
-## Deployment (Render.com)
-
-1. Push `vera_bot/` to a GitHub repo
-2. Connect to Render → New Web Service → select the repo
-3. Build: `pip install -r requirements.txt`
-4. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Add env var: `GROQ_API_KEY=<your key>`
-6. Deploy → copy the HTTPS URL → submit to magicpin
