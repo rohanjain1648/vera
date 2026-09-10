@@ -44,10 +44,67 @@ except ImportError:
         return None
 
 
-def _call_groq(system: str, user: str, temperature: float = 0.0) -> str:
-    """Call Groq API and return text response."""
+# ─── OpenAI fallback ──────────────────────────────────────────────────────────
+# Groq is the primary provider, but this key's 8000 TPM org-wide cap means a burst of
+# concurrent /v1/tick compositions (or Groq having a bad moment) can exhaust the retry
+# budget in composer.py's _call_groq(). Rather than let the trigger silently produce no
+# action, fall back to OpenAI when configured. Optional: if OPENAI_API_KEY isn't set,
+# behavior is unchanged (Groq-only, original exception propagates as before).
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+try:
+    from openai import OpenAI as OpenAIClient
+except ImportError:
+    OpenAIClient = None
+
+
+def _openai_configured() -> bool:
+    return bool(os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)) and OpenAIClient is not None
+
+
+def _call_openai_once(system: str, user: str, temperature: float, max_tokens: int) -> tuple[str, str]:
+    """Single OpenAI call attempt. Returns (text response, finish_reason)."""
+    api_key = os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)
+    model = os.environ.get("OPENAI_MODEL", OPENAI_MODEL)
+    client = OpenAIClient(api_key=api_key)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    choice = completion.choices[0]
+    return (choice.message.content or "").strip(), (choice.finish_reason or "")
+
+
+# openai/gpt-oss-120b (served via Groq) is a REASONING model: it spends tokens on a
+# hidden chain-of-thought before emitting the JSON answer. At the old max_tokens=800,
+# reasoning alone routinely exhausted the budget (finish_reason="length", empty content),
+# silently dropping into the fact-free fallback prompt below and causing fabricated output.
+# Fix: cap reasoning effort ("low") and give enough headroom for reasoning + full JSON body.
+DEFAULT_MAX_TOKENS = 1600
+DEFAULT_REASONING_EFFORT = "low"
+
+
+def _extract_retry_after(err: Exception) -> float:
+    """Parse Groq's 429 'Please try again in Xs' hint out of the error message."""
+    m = re.search(r"try again in ([\d.]+)s", str(err))
+    return float(m.group(1)) if m else 2.0
+
+
+def _call_groq_once(system: str, user: str, temperature: float,
+                     max_tokens: int, reasoning_effort: str) -> tuple[str, str]:
+    """Single Groq call attempt. Returns (text response, finish_reason)."""
     api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY)
     model = os.environ.get("GROQ_MODEL", GROQ_MODEL)
+
+    kwargs = {}
+    if reasoning_effort and "gpt-oss" in model:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     # Use official SDK if available
     if GroqClient is not None:
@@ -59,21 +116,25 @@ def _call_groq(system: str, user: str, temperature: float = 0.0) -> str:
                 {"role": "user", "content": user}
             ],
             temperature=temperature,
-            max_tokens=800,
+            max_tokens=max_tokens,
+            **kwargs,
         )
-        return completion.choices[0].message.content.strip()
+        choice = completion.choices[0]
+        return (choice.message.content or "").strip(), (choice.finish_reason or "")
 
     # Fallback: raw HTTP with proper headers
     from urllib import request as urlrequest
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ],
         "temperature": temperature,
-        "max_tokens": 800,
-    }).encode("utf-8")
+        "max_tokens": max_tokens,
+    }
+    payload.update(kwargs)
+    body = json.dumps(payload).encode("utf-8")
 
     req = urlrequest.Request(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -86,7 +147,63 @@ def _call_groq(system: str, user: str, temperature: float = 0.0) -> str:
     )
     resp = urlrequest.urlopen(req, timeout=25)
     data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["message"]["content"].strip()
+    choice = data["choices"][0]
+    content = (choice["message"]["content"] or "").strip()
+    return content, choice.get("finish_reason", "")
+
+
+def _call_groq(system: str, user: str, temperature: float = 0.0,
+                max_tokens: int = DEFAULT_MAX_TOKENS,
+                reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+                deadline: Optional[float] = None) -> tuple[str, str]:
+    """
+    Call Groq API and return (text response, finish_reason). Falls back to OpenAI
+    (if OPENAI_API_KEY is configured) when Groq can't complete the call at all.
+
+    Under concurrent /v1/tick load this account's Groq key hits its TPM rate limit
+    (429 tokens_per_minute). Left unhandled, main.py's per-trigger try/except swallows
+    that exception and the trigger silently produces NO action at all for the whole
+    tick — a bigger scoring risk than the reasoning-truncation bug, since it's the same
+    key shipped with the submission. Retry once after the server-suggested backoff,
+    bounded by the caller's deadline (the tick handler's own 30s-safe wall-clock budget)
+    so a single stuck call can never blow the harness timeout. If Groq still fails
+    (rate limit exhausted, or any other error), hand off to OpenAI as a last resort
+    before giving up — same grounded prompt, just a different provider.
+    """
+    try:
+        return _call_groq_once(system, user, temperature, max_tokens, reasoning_effort)
+    except Exception as e:
+        is_rate_limit = "429" in str(e) or "rate_limit" in str(e).lower()
+        if not is_rate_limit:
+            return _fallback_to_openai(system, user, temperature, max_tokens, e)
+
+        wait = _extract_retry_after(e)
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0.5:
+                return _fallback_to_openai(system, user, temperature, max_tokens, e)
+            wait = min(wait, max(0.1, remaining - 0.5))
+        time.sleep(wait)
+
+        try:
+            return _call_groq_once(system, user, temperature, max_tokens, reasoning_effort)
+        except Exception as e2:
+            return _fallback_to_openai(system, user, temperature, max_tokens, e2)
+
+
+def _fallback_to_openai(system: str, user: str, temperature: float,
+                         max_tokens: int, groq_error: Exception) -> tuple[str, str]:
+    """Try OpenAI when Groq has exhausted its own retries. Re-raises the original
+    Groq error if OpenAI isn't configured, so behavior is unchanged when no
+    OPENAI_API_KEY is present."""
+    if not _openai_configured():
+        raise groq_error
+    try:
+        return _call_openai_once(system, user, temperature, max_tokens)
+    except Exception:
+        # If OpenAI also fails, surface the original Groq error — it's the primary
+        # provider and its failure mode is the one callers already handle.
+        raise groq_error
 
 
 def _parse_llm_output(raw: str) -> Dict[str, Any]:
@@ -156,25 +273,39 @@ def compose(
     category: Dict,
     merchant: Dict,
     trigger: Dict,
-    customer: Optional[Dict] = None
+    customer: Optional[Dict] = None,
+    deadline: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Core composition function.
     Returns dict with: body, cta, send_as, suppression_key, rationale
+    `deadline` (time.time()-based) bounds retry waits so a caller with its own
+    wall-clock budget (e.g. the /v1/tick handler) never blocks past it.
     """
     system_prompt = build_system_prompt(category, merchant, trigger, customer)
     user_prompt = build_user_prompt(category, merchant, trigger, customer)
 
-    raw = _call_groq(system_prompt, user_prompt, temperature=0.0)
+    raw, finish_reason = _call_groq(system_prompt, user_prompt, temperature=0.0, deadline=deadline)
     composed = _parse_llm_output(raw)
 
+    if not composed.get("body") and finish_reason == "length":
+        # The model's hidden reasoning ate the whole token budget before it could write
+        # the JSON answer. Retry the SAME grounded prompt with more headroom rather than
+        # dropping into a fact-free fallback — this keeps specificity/grounding intact.
+        raw, finish_reason = _call_groq(system_prompt, user_prompt, temperature=0.0,
+                                         max_tokens=DEFAULT_MAX_TOKENS * 2, deadline=deadline)
+        composed = _parse_llm_output(raw)
+
     if not composed.get("body"):
-        # Retry once with a simpler prompt
+        # Last resort: simpler prompt, but still carrying the real grounding facts
+        # (never fact-free — a fact-free fallback is what causes fabrication).
         fallback_prompt = _build_fallback_prompt(category, merchant, trigger, customer)
-        raw2 = _call_groq(
-            "You are Vera, magicpin's merchant growth assistant. Compose a short, specific WhatsApp message.",
+        raw2, _ = _call_groq(
+            "You are Vera, magicpin's merchant growth assistant. Compose a short, specific "
+            "WhatsApp message using ONLY the facts given below. Never invent numbers, offers, "
+            "or claims not present in the context.",
             fallback_prompt,
-            temperature=0.1
+            temperature=0.1, deadline=deadline
         )
         composed = _parse_llm_output(raw2)
         if not composed.get("body"):
@@ -190,7 +321,8 @@ def compose_action_response(
     category: Dict,
     merchant: Dict,
     trigger: Dict,
-    conv_state: Optional[Dict] = None
+    conv_state: Optional[Dict] = None,
+    deadline: Optional[float] = None
 ) -> str:
     """
     Compose an ACTION message when merchant says 'yes/let's do it'.
@@ -203,7 +335,9 @@ def compose_action_response(
         "Be specific, brief, and action-oriented. No preambles."
     )
     user = build_action_prompt(category, merchant, trigger, conv_state)
-    raw = _call_groq(system, user, temperature=0.0)
+    raw, finish_reason = _call_groq(system, user, temperature=0.0, deadline=deadline)
+    if not raw and finish_reason == "length":
+        raw, _ = _call_groq(system, user, temperature=0.0, max_tokens=DEFAULT_MAX_TOKENS * 2, deadline=deadline)
     # Strip JSON if returned
     data = _parse_llm_output(raw)
     if data.get("body"):
@@ -216,7 +350,8 @@ def compose_followup(
     merchant: Dict,
     trigger: Dict,
     conv_state: Optional[Dict],
-    merchant_message: str
+    merchant_message: str,
+    deadline: Optional[float] = None
 ) -> str:
     """
     Compose a follow-up reply given the merchant's latest message.
@@ -229,7 +364,9 @@ def compose_followup(
         "Never ask more than one question. No preambles."
     )
     user = build_followup_prompt(category, merchant, trigger, conv_state, merchant_message)
-    raw = _call_groq(system, user, temperature=0.0)
+    raw, finish_reason = _call_groq(system, user, temperature=0.0, deadline=deadline)
+    if not raw and finish_reason == "length":
+        raw, _ = _call_groq(system, user, temperature=0.0, max_tokens=DEFAULT_MAX_TOKENS * 2, deadline=deadline)
     data = _parse_llm_output(raw)
     if data.get("body"):
         return data["body"]
@@ -237,17 +374,50 @@ def compose_followup(
 
 
 def _build_fallback_prompt(category, merchant, trigger, customer):
-    """Simple fallback prompt when main composition fails."""
-    merchant_name = merchant.get("identity", {}).get("owner_first_name") or \
-                    merchant.get("identity", {}).get("name", "")
+    """
+    Last-resort fallback prompt when main composition fails twice.
+    IMPORTANT: must still carry real grounding facts. A fact-free fallback is what
+    causes the model to fabricate plausible-sounding but invented numbers/claims —
+    that was the original root cause of low specificity/fabrication penalties.
+    """
+    identity = merchant.get("identity", {})
+    merchant_name = identity.get("owner_first_name") or identity.get("name", "")
     kind = trigger.get("kind", "")
     sup_key = trigger.get("suppression_key", "")
+    perf = merchant.get("performance", {})
+    active_offers = [o.get("title") for o in merchant.get("offers", []) if o.get("status") == "active"]
+    signals = merchant.get("signals", [])
+    trg_payload = trigger.get("payload", {})
+
+    digest = category.get("digest", [])
+    relevant_digest = None
+    if trg_payload.get("top_item_id"):
+        relevant_digest = next((d for d in digest if d.get("id") == trg_payload["top_item_id"]), None)
+
+    facts = [
+        f"Merchant: {identity.get('name', '')} ({merchant_name}) in {identity.get('locality', '')}",
+        f"Performance (30d): views={perf.get('views', '?')}, calls={perf.get('calls', '?')}, ctr={perf.get('ctr', '?')}",
+        f"Active offers: {active_offers or 'none'}",
+        f"Signals: {signals}",
+        f"Trigger kind: {kind}, payload: {json.dumps(trg_payload)}",
+    ]
+    if relevant_digest:
+        facts.append(
+            f"Digest finding: {relevant_digest.get('title', '')} "
+            f"(source: {relevant_digest.get('source', '')}, trial_n={relevant_digest.get('trial_n', '')}) "
+            f"— {relevant_digest.get('summary', '')}"
+        )
+    if customer:
+        cust_identity = customer.get("identity", {})
+        facts.append(f"Customer: {cust_identity.get('name', '')}, language: {cust_identity.get('language_pref', '')}")
+
+    facts_block = "\n".join(f"- {f}" for f in facts)
+
     return (
-        f"Write a short WhatsApp message from Vera to {merchant_name}. "
-        f"Trigger: {kind}. "
-        f"Merchant: {merchant.get('identity', {}).get('name', '')} in "
-        f"{merchant.get('identity', {}).get('locality', '')}. "
-        f"Be specific and useful. End with one clear question. "
+        f"Write a short WhatsApp message from Vera to {merchant_name}.\n\n"
+        f"ONLY use these facts — do not invent any number, claim, or offer not listed here:\n"
+        f"{facts_block}\n\n"
+        f"Be specific and useful. End with one clear question or CTA. "
         f"Return JSON: {{\"body\": \"...\", \"cta\": \"open_ended\", "
         f"\"send_as\": \"vera\", \"suppression_key\": \"{sup_key}\", "
         f"\"rationale\": \"...\"}}"

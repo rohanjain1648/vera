@@ -6,6 +6,7 @@ All 5 required endpoints: /v1/healthz, /v1/metadata, /v1/context, /v1/tick, /v1/
 import os
 import time
 import json
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -64,6 +65,21 @@ suppressed_merchants: Set[str] = set()
 # Suppression keys already acted on this test session (dedup across ticks)
 fired_suppression_keys: Set[str] = set()
 
+# Suppression keys currently submitted to the compose pool but not yet resolved —
+# prevents an overlapping tick from submitting a duplicate call for the same trigger.
+in_flight_keys: Set[str] = set()
+
+# Groq TPM budget on this key is tight (8000 tokens/min on openai/gpt-oss-120b — an
+# org-wide cap, confirmed across models) and each composition costs ~2000-2600 tokens.
+# A single shared, long-lived pool (rather than a fresh ThreadPoolExecutor per /v1/tick
+# call) is essential: creating+abandoning a pool every tick lets orphaned in-flight
+# Groq calls from a prior tick keep running unbounded in the background, competing with
+# the NEXT tick's fresh calls for the same tiny TPM budget and starving it completely
+# (observed: tick2 dropped from 5 successes to 0 once tick1's leftovers were still live).
+# A fixed-size shared pool naturally throttles total concurrent Groq calls across ticks.
+TICK_MAX_WORKERS = 3
+_compose_executor = concurrent.futures.ThreadPoolExecutor(max_workers=TICK_MAX_WORKERS)
+
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 
 class ContextBody(BaseModel):
@@ -106,6 +122,9 @@ def _get_payload(scope: str, cid: str) -> Optional[dict]:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
+@app.get("/")
+@app.get("/health")
+@app.get("/healthz")
 @app.get("/v1/healthz")
 async def healthz():
     """Liveness probe — judge polls every 60s."""
@@ -174,12 +193,20 @@ async def push_context(body: ContextBody):
     }
 
 
+# Harness allows up to 30s per response. Leave real margin for network/serialization
+# and stop launching/waiting on new LLM work once we're inside that margin, so a slow
+# or rate-limited Groq call can never make /v1/tick itself time out.
+TICK_WALL_CLOCK_BUDGET_S = 18.0
+
+
 @app.post("/v1/tick")
 async def tick(body: TickBody):
     """
     Periodic wake-up. Evaluate available triggers and compose proactive messages.
-    Returns up to 20 actions per tick.
+    Returns up to 20 actions per tick, bounded by TICK_WALL_CLOCK_BUDGET_S.
     """
+    tick_start = time.time()
+    tick_deadline = tick_start + TICK_WALL_CLOCK_BUDGET_S
     actions = []
 
     # Build list of (trigger_id, trigger_payload) sorted by urgency desc
@@ -218,7 +245,7 @@ async def tick(body: TickBody):
             return None
 
         try:
-            composed = compose(category, merchant, trg, customer)
+            composed = compose(category, merchant, trg, customer, deadline=tick_deadline)
             if not composed or not composed.get("body"):
                 return None
 
@@ -253,28 +280,71 @@ async def tick(body: TickBody):
             print(f"[WARN] Compose failed for {tid}: {e}", file=sys.stderr)
             return None
 
-    # Filter candidates
+    # Filter candidates — skip already-fired triggers AND ones already submitted to the
+    # shared pool by an earlier tick that hasn't resolved yet (in_flight_keys), otherwise
+    # an overlapping tick would submit a duplicate call for the same trigger and burn
+    # more of the shared TPM budget on redundant work.
     candidates = []
     for tid, trg in trigger_queue:
         if len(candidates) >= 20:
             break
         sup_key = trg.get("suppression_key", "")
-        if sup_key and sup_key in fired_suppression_keys:
+        if sup_key and (sup_key in fired_suppression_keys or sup_key in in_flight_keys):
             continue
         candidates.append((tid, trg))
 
-    if candidates:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(candidates), 8)) as executor:
-            results = list(executor.map(_process_one_trigger, candidates))
+    def _finalize(fut) -> Optional[dict]:
+        """
+        Apply a resolved future's result to shared state exactly once. Used both for
+        futures that finished within this tick's budget (to build the response) and,
+        via add_done_callback, for ones that finish later after being abandoned by an
+        earlier tick — so a late success still gets recorded and isn't retried forever.
+        """
+        item = futures.get(fut)
+        sup_key = (item[1].get("suppression_key", "") if item else "") or ""
+        if sup_key:
+            in_flight_keys.discard(sup_key)
+        try:
+            res = fut.result()
+        except Exception:
+            return None
+        if not res:
+            return None
+        conv_id, merchant_id, customer_id, body_text, trg, sup_key, action = res
+        if sup_key:
+            fired_suppression_keys.add(sup_key)
+        conversation_manager.create(conv_id, merchant_id, customer_id, body_text, trg)
+        return action
 
-        for res in results:
-            if res:
-                conv_id, merchant_id, customer_id, body_text, trg, sup_key, action = res
-                if sup_key:
-                    fired_suppression_keys.add(sup_key)
-                conversation_manager.create(conv_id, merchant_id, customer_id, body_text, trg)
+    if candidates:
+        futures = {}
+        for item in candidates:
+            sup_key = item[1].get("suppression_key", "")
+            if sup_key:
+                in_flight_keys.add(sup_key)
+            futures[_compose_executor.submit(_process_one_trigger, item)] = item
+
+        remaining = max(0.5, tick_deadline - time.time())
+        done, not_done = concurrent.futures.wait(futures, timeout=remaining)
+
+        for fut in done:
+            action = _finalize(fut)
+            if action:
                 actions.append(action)
+
+        # Anything still in flight when the budget runs out is abandoned for THIS
+        # response (never block past the harness's timeout) — cancel() actually stops
+        # queued-but-not-started work on the shared pool; already-running calls finish
+        # in the background and _finalize still records their result via this callback,
+        # so they won't be silently retried duplicate-fashion by a later tick.
+        for fut in not_done:
+            if not fut.cancel():
+                fut.add_done_callback(_finalize)
+            else:
+                item = futures.get(fut)
+                sup_key = item[1].get("suppression_key", "") if item else ""
+                if sup_key:
+                    in_flight_keys.discard(sup_key)
 
     return {"actions": actions}
 
@@ -285,6 +355,7 @@ async def reply(body: ReplyBody):
     Handle reply from simulated merchant/customer.
     Returns: {action: send|wait|end, body?, cta?, rationale}
     """
+    reply_deadline = time.time() + TICK_WALL_CLOCK_BUDGET_S
     conv_id = body.conversation_id
     merchant_id = body.merchant_id
     customer_id = body.customer_id
@@ -377,7 +448,7 @@ async def reply(body: ReplyBody):
 
         if merchant and category and trigger:
             try:
-                action_body = compose_action_response(category, merchant, trigger, conv_state)
+                action_body = compose_action_response(category, merchant, trigger, conv_state, deadline=reply_deadline)
                 conversation_manager.add_turn(conv_id, "vera", action_body)
                 return {
                     "action": "send",
@@ -438,7 +509,7 @@ async def reply(body: ReplyBody):
 
     if merchant and category and trigger:
         try:
-            next_body = compose_followup(category, merchant, trigger, conv_state, message)
+            next_body = compose_followup(category, merchant, trigger, conv_state, message, deadline=reply_deadline)
             conversation_manager.add_turn(conv_id, "vera", next_body)
             return {
                 "action": "send",

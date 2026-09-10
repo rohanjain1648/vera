@@ -213,8 +213,12 @@ State days remaining clearly. Single binary CTA.
 """,
     "gbp_unverified": """
 TRIGGER TYPE: Google Business Profile Unverified
-State the estimated uplift from verification (if in trigger payload).
-Explain the verification path simply. Offer to guide them through it.
+Trigger payload has an estimated_uplift_pct field (a decimal, e.g. 0.3) — convert it to
+a percentage and state it as the concrete upside (e.g. 0.3 -> "~30%"). Never write the
+literal word "payload" or leave the number as a placeholder.
+Explain the verification path from payload.verification_path in plain words.
+Do not invent peer-merchant counts or CTR figures that aren't in the context — if no
+such peer data is given, skip the social-proof line entirely.
 One-step ask: "Want me to start the verification now?"
 """,
     "trial_followup": """
@@ -274,14 +278,17 @@ def _context_summary(category: Dict, merchant: Dict, trigger: Dict,
     digest = category.get("digest", [])
     peer_stats = category.get("peer_stats", {})
 
-    # Find the specific digest item referenced in trigger if any
+    # Find the specific digest item referenced in trigger, if any. IMPORTANT: only
+    # surface a digest item when the trigger's payload actually points to one via
+    # top_item_id. A blanket "digest[0] if nothing matched" fallback used to inject an
+    # unrelated research finding (e.g. the fluoride-recall study) into completely
+    # unrelated triggers like perf_dip/renewal_due — the model would then weave it in
+    # as if it were the cause/solution, producing an incoherent, off-topic message.
     trg_payload = trigger.get("payload", {})
     relevant_digest = None
     if trg_payload.get("top_item_id"):
         tid = trg_payload["top_item_id"]
         relevant_digest = next((d for d in digest if d.get("id") == tid), None)
-    if not relevant_digest and digest:
-        relevant_digest = digest[0]
 
     # Seasonal beats
     seasonal = category.get("seasonal_beats", [])
@@ -452,6 +459,7 @@ ABSOLUTE RULES (violating any = score cap at 5/10):
 9. Match voice to category — dentists get peer clinical tone for merchant, warm clinical for customer.
 10. Body must be concise (under 350 characters for customer, under 450 for merchant).
 11. Reference actual active offers only — never expired ones.
+12. NEVER write a placeholder in place of a real value — no "(payload)", "N merchants", "X%", "TBD", or similar. If a specific number for a claim isn't present in the context above, drop that entire claim/sentence instead of writing a placeholder.
 
 COMPULSION LEVERS (use 1-3 per message):
 - Specificity/verifiability: concrete numbers, dates, source citations
